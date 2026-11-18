@@ -47,7 +47,7 @@ python build_index.py --lang ja --corpus-dir ./corpus-ja
 python build_index.py --lang en --corpus-dir ./corpus-en
 ```
 
-The corpora have 8.2M (ja) and 45.5M (en) documents. The Japanese index also stores kuromoji and character bigram
+The corpora have 8.2M (ja) and 42.9M (en) documents. The Japanese index also stores kuromoji and character bigram
 sub-fields with term vectors, so expect it to be well over the size of its text (40 GB).
 `build_index.py` can be run again after an interruption: documents are indexed under fixed ids, so indexed ones are
 overwritten rather than duplicated.
