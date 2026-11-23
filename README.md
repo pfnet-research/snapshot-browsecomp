@@ -29,6 +29,10 @@ python reconstruct.py --lang ja --output-dir ./corpus-ja
 python reconstruct.py --lang en --output-dir ./corpus-en
 ```
 
+The documents are spread over the rows of each source file, so `reconstruct.py` reads most of its row groups: about
+150 GB from HF for `ja` and 600 GB for `en`, which become 20 GB and 93 GB of parquet. `--num-proc` (default 8) is
+the number of files read in parallel; set it to the CPUs you have.
+
 ## 2. Start OpenSearch and build the index
 
 [`docker-compose.yml`](./docker-compose.yml) runs a single-node OpenSearch on `localhost:9200`, with the
@@ -47,8 +51,10 @@ python build_index.py --lang ja --corpus-dir ./corpus-ja
 python build_index.py --lang en --corpus-dir ./corpus-en
 ```
 
-The corpora have 8.2M (ja) and 42.9M (en) documents. The Japanese index also stores kuromoji and character bigram
-sub-fields with term vectors, so expect it to be well over the size of its text (40 GB).
+The corpora have 8.2M (ja) and 42.9M (en) documents, and the indexes take about 190 GB (ja) and 170 GB (en); the
+Japanese one is larger than its text because it also stores kuromoji and character bigram sub-fields with term
+vectors. Leave memory beyond OpenSearch's heap for the page cache, about 360 GB for both indexes, so that searches
+read them from memory rather than from disk.
 `build_index.py` can be run again after an interruption: documents are indexed under fixed ids, so indexed ones are
 overwritten rather than duplicated.
 
@@ -76,12 +82,13 @@ python evaluate.py \
 - `--no-tools` asks the model for the answer without the search tools, from its own knowledge only.
 - Searches are BM25 over `title` and `text`, top `--max-results` (default 10) documents.
 - `--opensearch-url` / `--index` point at another OpenSearch, and `--aoss-host` at an Amazon OpenSearch
-  Serverless collection (with boto3 credentials).
+  Serverless collection (with boto3 credentials). `--opensearch-token-env <ENV>` sends the token in `<ENV>` as
+  `Authorization: Bearer`, for an OpenSearch behind a gateway that requires one.
 
 `<output-dir>/<lang>.jsonl` has one record per question: the predicted answer, the judge's verdict and
-explanation, and the whole conversation. `<output-dir>/summary.json` has the accuracy of each language and of all
-of them. Running the same command again asks only the questions that have no record yet or whose record has an
-`error`.
+explanation, the whole conversation, and the URLs of the pages the model read (`visited_urls`).
+`<output-dir>/summary.json` has the accuracy of each language and of all of them. Running the same command again
+asks only the questions that have no record yet or whose record has an `error`.
 
 ## License
 

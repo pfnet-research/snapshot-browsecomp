@@ -6,8 +6,16 @@ documents as that one does: Japanese text is matched on kuromoji (``.analyzed``)
 sub-fields, English text on the standard analyzer. Kuromoji and the ICU normalizer need the ``analysis-kuromoji``
 and ``analysis-icu`` plugins, which the ``Dockerfile`` next to this file installs.
 
+The index has 2 shards by default, as the index the benchmark was made with: BM25 statistics are per shard, so the
+number of shards changes the ranking. Fewer shards also make each search cheaper in CPU, so a node serves more
+concurrent searches, though a single search takes longer. On 32 CPUs, the Japanese index served about 46 searches
+a second with 2 shards and 31 with 4, at 16 concurrent searches.
+
 A document's id is its file and row in the corpus, so running this again after an interruption overwrites what
-was indexed rather than adding duplicates.
+was indexed rather than adding duplicates. An overwritten document stays in the index as a deleted one until its
+segment is merged, and deleted documents still count in BM25's document statistics, so at the end the segments with
+many deleted documents are merged (``only_expunge_deletes``); on a fresh index there are none and this is instant.
+The index is not merged further into one segment per shard, which would halve the throughput of concurrent searches.
 
 This file only depends on pyarrow and opensearch-py, so that it can be distributed with the benchmark.
 
@@ -157,6 +165,7 @@ def build_index(
 
     client.indices.put_settings(index=index, body={"index": {"refresh_interval": "1s"}})
     client.indices.refresh(index=index)
+    client.indices.forcemerge(index=index, only_expunge_deletes=True, request_timeout=24 * 3600)
     count = client.count(index=index)["count"]
     print(f"Indexed {n} documents; {index} has {count} documents")
     return n
@@ -168,7 +177,7 @@ def main() -> None:
     parser.add_argument("--corpus-dir", type=str, required=True, help="The --output-dir of reconstruct.py")
     parser.add_argument("--opensearch-url", type=str, default=DEFAULT_OPENSEARCH_URL)
     parser.add_argument("--index", type=str, default=DEFAULT_INDEX, help="Index name; {lang} is replaced")
-    parser.add_argument("--num-shards", type=int, default=4)
+    parser.add_argument("--num-shards", type=int, default=2)
     parser.add_argument("--num-threads", type=int, default=4)
     parser.add_argument("--chunk-bytes", type=int, default=16 * 1024 * 1024, help="Maximum size of a bulk request")
     parser.add_argument("--recreate", action="store_true", help="Delete the index first if it exists")

@@ -11,7 +11,10 @@ The questions are in the format of BrowseComp: one row per question with ``probl
 are, and are decrypted here. Each language is one subset (only ``ja`` so far); ``--langs`` picks which are evaluated.
 
 Searches are plain BM25 over ``title`` and ``text``, with no category or domain weighting. The index is the one
-``build_index.py`` builds; ``--aoss-host`` searches an Amazon OpenSearch Serverless collection instead.
+``build_index.py`` builds; ``--aoss-host`` searches an Amazon OpenSearch Serverless collection instead. OpenSearch
+answers with status 200 even when some shards fail, with the hits of the other shards only, so such a search is
+asked again, as is one refused with 429 or 5xx; when it keeps failing, the question gets an error instead of the
+model reading partial or no results.
 
 Results go to ``<output-dir>/<lang>.jsonl``, one line per question, and the accuracies to
 ``<output-dir>/summary.json``. A question already in ``<lang>.jsonl`` without an error is not asked again, so an
@@ -27,9 +30,11 @@ distributed with the benchmark.
 import argparse
 import asyncio
 import base64
+import contextvars
 import hashlib
 import json
 import os
+import random
 import string
 import time
 from collections.abc import Awaitable, Callable
@@ -47,8 +52,14 @@ DIFFICULTIES = ("lite", "hard")
 
 DEFAULT_MAX_TOOL_CALLS = 40
 DEFAULT_MAX_RESULTS = 10
+DEFAULT_SEARCH_ATTEMPTS = 8
 MAX_VISIT_CHARS = 8 * 1024
 SNIPPET_CHARS = 200
+# How many characters of a document the highlighter analyzes: OpenSearch's default
+# `index.highlight.max_analyzed_offset`. Without it, a longer document that matches fails the search on its shard,
+# and the question ends in an error. With it, a match beyond this offset just has no highlight, and the snippet is
+# the start of the text.
+HIGHLIGHT_MAX_ANALYZER_OFFSET = 1_000_000
 # Rounds the loop may run beyond `max_tool_calls`, for a model that keeps calling tools after the budget is spent.
 _ROUND_SAFETY_MARGIN = 2
 _SEARCH_FIELDS = ["title", "text"]
@@ -241,6 +252,7 @@ def search_body(query: str, lang: str, size: int) -> dict[str, Any]:
         "size": size,
         "_source": ["title", "text", "url"],
         "highlight": {
+            "max_analyzer_offset": HIGHLIGHT_MAX_ANALYZER_OFFSET,
             "fields": {f"text{suffix}": {} for suffix in suffixes},
             "fragment_size": SNIPPET_CHARS,
             "number_of_fragments": 1,
@@ -263,18 +275,72 @@ def _snippet(hit: dict[str, Any], text: str) -> str:
     return text[:SNIPPET_CHARS]
 
 
-class Searcher:
-    """Searches the corpus of each language with a synchronous opensearch-py client, in threads."""
+class SearchUnavailableError(RuntimeError):
+    """A search that kept failing or returning partial results; it fails the question rather than reaching the model."""
 
-    def __init__(self, client: Any, index: str, max_results: int) -> None:
+    def __init__(self, message: str, retries: int) -> None:
+        super().__init__(message)
+        self.retries = retries
+
+
+def _partial(response: dict[str, Any]) -> str:
+    """Why ``response`` lacks the hits of part of the index, or "" when it has them all."""
+    shards = response.get("_shards") or {}
+    if shards.get("failed"):
+        reasons = [str((f.get("reason") or {}).get("type")) for f in shards.get("failures") or []]
+        return f"{shards['failed']} of {shards.get('total')} shards failed ({', '.join(reasons)})"
+    if response.get("timed_out"):
+        return "timed out"
+    return ""
+
+
+class Searcher:
+    """Searches the corpus of each language with a synchronous opensearch-py client, in threads.
+
+    A search refused with 429 or 5xx, or answered with failed shards (or timed out), is asked again, ``attempts``
+    times in all, with a backoff. A connection error or timeout, which the client has already retried, fails the
+    question at once.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        index: str,
+        max_results: int,
+        attempts: int = DEFAULT_SEARCH_ATTEMPTS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self._client = client
         self._index = index
         self._max_results = max_results
+        self._attempts = attempts
+        self._sleep = sleep
 
-    def _search(self, query: str, lang: str) -> list[Document]:
-        response = self._client.search(
-            index=self._index.format(lang=lang), body=search_body(query, lang, self._max_results)
-        )
+    def _search(self, query: str, lang: str) -> tuple[list[Document], int]:
+        """The documents, and how many times the search was asked again."""
+        index = self._index.format(lang=lang)
+        body = search_body(query, lang, self._max_results)
+        for attempt in range(self._attempts):
+            try:
+                response = self._client.search(index=index, body=body)
+                reason = _partial(response)
+            except Exception as e:  # noqa: BLE001 -- the others are raised
+                # opensearch-py's TransportError has the HTTP status; ConnectionError has "N/A" and
+                # ConnectionTimeout "TIMEOUT"
+                status = getattr(e, "status_code", None)
+                if status in ("N/A", "TIMEOUT"):
+                    raise SearchUnavailableError(f"{index}: {type(e).__name__}: {e}", attempt) from e
+                if not (isinstance(status, int) and (status == 429 or status >= 500)):
+                    raise
+                reason = f"{type(e).__name__}: {e}"
+            if not reason:
+                return self._documents(response), attempt
+            if attempt + 1 < self._attempts:
+                self._sleep(min(2**attempt, 30) * random.uniform(0.5, 1.5))
+        raise SearchUnavailableError(f"{index}: {self._attempts} attempts failed: {reason}", self._attempts - 1)
+
+    @staticmethod
+    def _documents(response: dict[str, Any]) -> list[Document]:
         docs = []
         for hit in response["hits"]["hits"]:
             source = hit["_source"]
@@ -286,15 +352,26 @@ class Searcher:
             )
         return docs
 
-    async def search(self, query: str, lang: str) -> list[Document]:
+    async def search(self, query: str, lang: str) -> tuple[list[Document], int]:
         return await asyncio.to_thread(self._search, query, lang)
 
 
-def make_opensearch_client(url: str, aoss_host: str | None, aws_region: str) -> Any:
+def make_opensearch_client(url: str, aoss_host: str | None, aws_region: str, token: str | None = None) -> Any:
+    """A client of the OpenSearch at ``url``, or of the Serverless collection ``aoss_host``.
+
+    ``token`` is sent as ``Authorization: Bearer <token>``, for an OpenSearch behind a gateway that checks one.
+    """
     from opensearchpy import OpenSearch, RequestsHttpConnection
 
     if aoss_host is None:
-        return OpenSearch(hosts=[url], http_compress=True, timeout=120, retry_on_timeout=True, max_retries=3)
+        return OpenSearch(
+            hosts=[url],
+            headers={"Authorization": f"Bearer {token}"} if token else None,
+            http_compress=True,
+            timeout=120,
+            retry_on_timeout=True,
+            max_retries=3,
+        )
     import boto3
     from opensearchpy import AWSV4SignerAuth
 
@@ -404,6 +481,10 @@ class ToolSession:
     def __init__(self, searcher: Searcher) -> None:
         self._searcher = searcher
         self._docs: dict[str, Document] = {}
+        # Searches asked again (see ``Searcher``), over all the searches of the question.
+        self.search_retries = 0
+        # The URLs of the documents read with ``visit``, once each, in the order first read.
+        self.visited_urls: list[str] = []
 
     async def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "search":
@@ -412,7 +493,13 @@ class ToolSession:
                 raise ValueError("`query` must be a non-empty string")
             lang = arguments.get("lang")
             results = []
-            for doc in await self._searcher.search(query, lang if lang in LANGS else "en"):
+            try:
+                docs, retries = await self._searcher.search(query, lang if lang in LANGS else "en")
+            except SearchUnavailableError as e:
+                self.search_retries += e.retries
+                raise
+            self.search_retries += retries
+            for doc in docs:
                 id = f"d{len(self._docs) + 1}"
                 self._docs[id] = doc
                 results.append({"id": id, "title": doc.title, "url": doc.url, "snippet": doc.snippet})
@@ -422,6 +509,8 @@ class ToolSession:
             if id not in self._docs:
                 raise ValueError(f"`{id}` is not an id a `search` has returned")
             doc = self._docs[id]
+            if doc.url not in self.visited_urls:
+                self.visited_urls.append(doc.url)
             return {"url": doc.url, "title": doc.title, **page_window(doc.text, arguments)}
         raise ValueError(f"unknown tool `{name}`")
 
@@ -452,20 +541,53 @@ class AgentResult:
     messages: list[dict[str, Any]]
 
 
-# Attempts of a completion whose response has no choices: OpenRouter returns its errors that way, with status 200,
-# so the client does not retry them itself.
-_COMPLETION_ATTEMPTS = 5
+# Attempts of a completion that fails for a while (the client itself does not retry): refused with 429 or 5xx, or not
+# connected, or answered with status 200 but with no choices or with a choice that ends in ``error``, which is how
+# OpenRouter returns its errors and those of a provider that fails in the middle of an answer. The backoff
+# (15, 30, 60, then 120 seconds) waits out a rate limit or a restarting server for about 10 minutes in all. A request
+# that runs out ``--timeout`` is not asked again: the model is most likely generating without end (a server such as
+# vLLM goes on generating it after the client gives up), so the question ends with an error, to be asked again later.
+_COMPLETION_ATTEMPTS = 8
+_COMPLETION_BACKOFF_MAX_SECONDS = 120
+
+# The raw responses of the completions of the current question, when they are kept (``--keep-responses``).
+_responses: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar("responses", default=None)
+
+
+def _transient(e: Exception) -> bool:
+    import openai
+
+    if isinstance(e, openai.APITimeoutError):
+        return False
+    if isinstance(e, openai.APIConnectionError):
+        return True
+    return isinstance(e, openai.APIStatusError) and (e.status_code == 429 or e.status_code >= 500)
 
 
 async def complete(client: Any, **kwargs: Any) -> Any:
-    """``client.chat.completions.create``, asked again with a backoff while the response has no choices."""
+    """``client.chat.completions.create``, asked again with a backoff while it fails for a while (see above)."""
+    failure = ""
     for attempt in range(_COMPLETION_ATTEMPTS):
-        response = await client.chat.completions.create(**kwargs)
-        if response.choices:
-            return response
-        if attempt + 1 < _COMPLETION_ATTEMPTS:
-            await asyncio.sleep(2**attempt)
-    raise RuntimeError(f"no choices in {_COMPLETION_ATTEMPTS} attempts: {getattr(response, 'error', None)}")
+        if attempt:
+            await asyncio.sleep(min(15 * 2 ** (attempt - 1), _COMPLETION_BACKOFF_MAX_SECONDS))
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if not _transient(e):
+                raise
+            failure = f"{type(e).__name__}: {e}"
+            continue
+        if not response.choices:
+            failure = f"no choices: {getattr(response, 'error', None)}"
+            continue
+        if response.choices[0].finish_reason == "error":
+            failure = f"finish_reason error: {getattr(response.choices[0], 'error', None)}"
+            continue
+        kept = _responses.get()
+        if kept is not None:
+            kept.append(response.model_dump(mode="json"))
+        return response
+    raise RuntimeError(f"{_COMPLETION_ATTEMPTS} attempts failed: {failure}")
 
 
 def _valid_json_arguments(arguments: str | None) -> str:
@@ -520,6 +642,8 @@ async def run_agent(
                     if not isinstance(arguments, dict):
                         raise ValueError("the arguments must be a JSON object")
                     result = await tools.call(call.function.name, arguments)
+                except SearchUnavailableError:
+                    raise
                 except Exception as e:  # noqa: BLE001 -- a failed call is the model's to read
                     result = {"error": f"{type(e).__name__}: {e}"}
             messages.append(
@@ -612,10 +736,18 @@ class Record:
     judge_explanation: str = ""
     tool_call_count: int = 0
     exceeded_tool_limit: bool = False
+    # Searches asked again because the engine failed or some shards did (see ``Searcher``).
+    search_retries: int = 0
+    # The URLs of the documents the model read, in the order first read.
+    visited_urls: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     # Non-empty when the question could not be answered or judged; such a question is asked again on resume.
     error: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # The raw responses of the model and of the judge (with reasoning, usage and the provider's extras), in order,
+    # when they are kept (``--keep-responses``).
+    model_responses: list[dict[str, Any]] = field(default_factory=list)
+    judge_responses: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def evaluate_question(
@@ -627,6 +759,7 @@ async def evaluate_question(
     judge_config: ModelConfig,
     searcher: Searcher | None,
     max_tool_calls: int,
+    keep_responses: bool = False,
 ) -> Record:
     """Answers ``question`` with the search tools, or without them when ``searcher`` is None, and judges it."""
     record = Record(
@@ -638,22 +771,28 @@ async def evaluate_question(
         difficulty=question.difficulty,
     )
     start = time.monotonic()
+    tools = None if searcher is None else ToolSession(searcher)
+    if keep_responses:
+        _responses.set(record.model_responses)
     try:
-        if searcher is None:
+        if tools is None:
             result = await run_without_tools(model_client, model_config, question)
         else:
-            result = await run_agent(
-                model_client, model_config, question, ToolSession(searcher), max_tool_calls=max_tool_calls
-            )
+            result = await run_agent(model_client, model_config, question, tools, max_tool_calls=max_tool_calls)
         record.messages = result.messages
         record.tool_call_count = result.tool_call_count
         record.exceeded_tool_limit = result.exceeded_tool_limit
         record.predicted_answer = extract_final_answer(result.final_message)
+        if keep_responses:
+            _responses.set(record.judge_responses)
         record.correct, record.judge_explanation = await judge(
             judge_client, judge_config, question, record.predicted_answer
         )
     except Exception as e:  # noqa: BLE001 -- recorded, and asked again on resume
         record.error = f"{type(e).__name__}: {e}"
+    if tools is not None:
+        record.search_retries = tools.search_retries
+        record.visited_urls = tools.visited_urls
     record.elapsed_seconds = time.monotonic() - start
     return record
 
@@ -680,6 +819,7 @@ def summarize(records_by_lang: dict[str, list[dict[str, Any]]]) -> dict[str, Any
             "accuracy": n_correct / n if n else 0.0,
             "n_error": sum(1 for r in records if r["error"]),
             "mean_tool_calls": sum(r["tool_call_count"] for r in records) / n if n else 0.0,
+            "search_retries": sum(r.get("search_retries", 0) for r in records),
         }
 
     summary = {lang: stats(records) for lang, records in records_by_lang.items()}
@@ -730,7 +870,7 @@ def _api_key(env: str | None, path: str | None) -> str:
 def _openai_client(base_url: str | None, api_key: str, timeout: float) -> Any:
     from openai import AsyncOpenAI
 
-    return AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=5)
+    return AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=0)
 
 
 def main() -> None:
@@ -755,8 +895,19 @@ def main() -> None:
     parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--extra-body", type=json.loads, default={}, help="JSON object passed to the API as is")
     parser.add_argument("--max-tool-calls", type=int, default=DEFAULT_MAX_TOOL_CALLS)
+    parser.add_argument(
+        "--keep-responses",
+        action="store_true",
+        help="Keep the raw response of every completion in the records, with the reasoning and usage",
+    )
     parser.add_argument("--no-tools", action="store_true", help="Answer without the search tools")
     parser.add_argument("--max-results", type=int, default=DEFAULT_MAX_RESULTS, help="Results per search")
+    parser.add_argument(
+        "--search-attempts",
+        type=int,
+        default=DEFAULT_SEARCH_ATTEMPTS,
+        help="Times a search is asked while it fails or some shards do, before the question gets an error",
+    )
     # The judge.
     parser.add_argument("--judge-model", type=str, default=DEFAULT_JUDGE_MODEL)
     parser.add_argument("--judge-base-url", type=str, default=None)
@@ -768,6 +919,9 @@ def main() -> None:
     parser.add_argument("--index", type=str, default=DEFAULT_INDEX, help="Index name; {lang} is replaced")
     parser.add_argument("--aoss-host", type=str, default=None, help="Search this OpenSearch Serverless host instead")
     parser.add_argument("--aws-region", type=str, default="ap-northeast-1")
+    parser.add_argument(
+        "--opensearch-token-env", type=str, default=None, help="Environment variable holding a bearer token for it"
+    )
     args = parser.parse_args()
 
     model_client = _openai_client(args.base_url, _api_key(args.api_key_env, args.api_key_file), args.timeout)
@@ -780,7 +934,15 @@ def main() -> None:
         None
         if args.no_tools
         else Searcher(
-            make_opensearch_client(args.opensearch_url, args.aoss_host, args.aws_region), args.index, args.max_results
+            make_opensearch_client(
+                args.opensearch_url,
+                args.aoss_host,
+                args.aws_region,
+                os.environ[args.opensearch_token_env] if args.opensearch_token_env else None,
+            ),
+            args.index,
+            args.max_results,
+            args.search_attempts,
         )
     )
 
@@ -793,6 +955,7 @@ def main() -> None:
             judge_config=judge_config,
             searcher=searcher,
             max_tool_calls=args.max_tool_calls,
+            keep_responses=args.keep_responses,
         )
 
     async def run_all() -> dict[str, list[dict[str, Any]]]:

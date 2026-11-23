@@ -22,6 +22,17 @@ import pyarrow.parquet as pq
 KEYS_DATASET = "pfnet/snapshot-browsecomp-search-corpus"
 
 _KEY_COLUMNS = ["source", "hf_repo", "hf_revision", "file", "row", "id", "category", "year"]
+# A process writes out its documents once it holds at least this many (checked after each source row group).
+_WRITE_BATCH_ROWS = 10_000
+_OUTPUT_SCHEMA = pa.schema(
+    [
+        ("title", pa.string()),
+        ("text", pa.string()),
+        ("url", pa.string()),
+        ("category", pa.string()),
+        ("year", pa.int64()),
+    ]
+)
 
 
 @dataclass(frozen=True)
@@ -89,15 +100,21 @@ def output_path(output_dir: str, keys: FileKeys) -> str:
 def reconstruct_file(
     keys: FileKeys, output_dir: str, open_fn: Callable[[str, str, str], BinaryIO] = _open_hf_file
 ) -> str:
-    """Writes the documents of ``keys`` to ``output_path(output_dir, keys)``. Existing outputs are kept as is."""
+    """Writes the documents of ``keys`` to ``output_path(output_dir, keys)``. Existing outputs are kept as is.
+
+    The documents are written out in batches of about ``_WRITE_BATCH_ROWS``, so a process holds one source row group
+    and one batch at a time, however many documents the file has (an English Wikipedia file has some 400k).
+    """
     out = output_path(output_dir, keys)
     if os.path.exists(out):
         return out
     source = _SOURCES[keys.source]
     order = sorted(range(len(keys.rows)), key=lambda i: keys.rows[i])
-    records: list[dict[str, Any]] = []
-    with open_fn(keys.hf_repo, keys.hf_revision, keys.file) as f:
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    tmp = f"{out}.tmp"
+    with open_fn(keys.hf_repo, keys.hf_revision, keys.file) as f, pq.ParquetWriter(tmp, _OUTPUT_SCHEMA) as writer:
         pf = pq.ParquetFile(f)
+        records: list[dict[str, Any]] = []
         group_start = 0
         cursor = 0
         for group in range(pf.metadata.num_row_groups):
@@ -121,13 +138,13 @@ def reconstruct_file(
                             "year": keys.years[i],
                         }
                     )
+                if len(records) >= _WRITE_BATCH_ROWS:
+                    writer.write_table(pa.Table.from_pylist(records, schema=_OUTPUT_SCHEMA))
+                    records = []
             group_start = group_end
         if cursor != len(order):
             raise ValueError(f"{keys.file} has only {group_start} rows")
-
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    tmp = f"{out}.tmp"
-    pq.write_table(pa.Table.from_pylist(records), tmp)
+        writer.write_table(pa.Table.from_pylist(records, schema=_OUTPUT_SCHEMA))
     os.replace(tmp, out)
     return out
 
